@@ -20,12 +20,14 @@ AUTH_TOKEN = require("ROCKET_AUTH_TOKEN", "личный токен доступ�
 # Поле _id ответа GET /api/v1/me. Берётся из ROCKET_USER_ID в .env.
 USER_ID = require("ROCKET_USER_ID", "id пользователя Rocket.Chat (поле _id в GET /api/v1/me). Это заголовок X-User-Id")
 
-# Сюда подставляется id комнаты вопросов (v1 и v2, канал dp_in).
-# Берётся DP_IN_ID из .env, а если его нет — DP_CTRL_ID.
-DP_IN_ID = pick("DP_IN_ID", "DP_CTRL_ID", hint="id комнаты, куда в v1 и v2 пишут вопросы. Id печатает python get_rooms.py")
-# Сюда подставляется id комнаты ответов (v1 и v2, канал dp_out).
-# Берётся DP_OUT_ID из .env, а если его нет — DP_CHAT_ID.
-DP_OUT_ID = pick("DP_OUT_ID", "DP_CHAT_ID", hint="id комнаты, куда в v1 и v2 бот пишет ответы. Id печатает python get_rooms.py")
+# Канал управления (команды, справка). Позже можно переименовать в dp_run
+# Сюда подставляется id комнаты команд (!new, !list, !help).
+# Берётся DP_CTRL_ID из .env, а если его нет — DP_IN_ID.
+DP_CTRL_ID = pick("DP_CTRL_ID", "DP_IN_ID", hint="id комнаты команд. Если отдельного имени нет, укажите тот же id в DP_IN_ID")
+# Канал работы (вопросы + ответы). Позже можно переименовать в dp_chat
+# Сюда подставляется id комнаты вопросов и ответов.
+# Берётся DP_CHAT_ID из .env, а если его нет — DP_OUT_ID.
+DP_CHAT_ID = pick("DP_CHAT_ID", "DP_OUT_ID", hint="id комнаты, куда пишут вопросы и куда бот отвечает. Если отдельного имени нет, укажите тот же id в DP_OUT_ID")
 
 # Сюда подставляется секретный ключ API DeepSeek.
 # Это заголовок Authorization: Bearer. Берётся из DEEPSEEK_API_KEY в .env.
@@ -52,28 +54,26 @@ ds_headers = {
     "Content-Type": "application/json",
 }
 
-HELP_TEXT = """📖 **Команды моста DeepSeek**
+HELP_TEXT = """📖 **Команды моста DeepSeek** (этот канал — управление)
 
 `!new <имя>` — создать новый чат (имя латиницей/цифрами/дефисами).
    Пример: `!new ssh-setup` → файл `2026-10-06-ssh-setup`
-`!list` — список активных чатов (из папки `chats\\`).
+`!list` — список активных чатов.
 `!use <chat_id>` — переключиться на существующий чат.
 `!current` — показать активный чат и модель.
-`!model flash` — `deepseek-flash` (быстрая, поддерживает изображения).
+`!model flash` — `deepseek-flash` (быстрая, умеет изображения).
 `!model pro` — `deepseek-v4-pro` (умная, только текст).
 `!help` — эта справка.
 
-**Рабочий процесс:**
-1. `!new mytask` — создаём контекст.
-2. Пишете вопросы обычным текстом — DeepSeek помнит их все.
-3. Хотите другую тему — `!new other-task`.
-4. Вернуться — `!use 2026-10-06-mytask`.
+**Как работать:**
+1. Сюда пишете только команды (`!new`, `!list`, …).
+2. Вопросы DeepSeek — в **канал работы** (dp_out).
+3. DeepSeek помнит весь диалог в рамках активного чата.
+4. Хотите другую тему — `!new other-task`, потом вопросы в dp_out.
+5. Вернуться — `!use 2026-10-06-mytask` здесь же.
 
 **Архивация:** перенесите ненужный файл из `chats\\` в `arch2026-XX\\` —
-он исчезнет из `!list`, но останется на диске.
-
-**Если писать без `!new`** сообщение идёт в последний активный чат.
-Если активного нет — автоматически создастся `YYYY-MM-DD-default`."""
+он исчезнет из `!list`, но останется на диске."""
 
 
 # ---------- Файловое хранилище ----------
@@ -164,13 +164,18 @@ def rc_get_history(room_id, count=20, oldest=None):
     return []
 
 
-def rc_send_message(room_id, text):
+def rc_send_message(room_id, text, own_msg_ids):
     r = requests.post(
         f"{ROCKET_URL}/api/v1/chat.postMessage",
         headers=rc_headers, json={"roomId": room_id, "text": text},
         verify=False, timeout=15,
     )
-    return r.json()
+    resp = r.json()
+    if resp.get("success"):
+        own_msg_ids.add(resp["message"]["_id"])
+    else:
+        print(f"[RC] postMessage error: {resp}")
+    return resp
 
 
 def rc_update_message(room_id, msg_id, text):
@@ -218,7 +223,7 @@ def call_deepseek_stream(messages, model):
         yield f"[DeepSeek exception] {e}"
 
 
-# ---------- Обработка команд ----------
+# ---------- Обработка команд (пишем в канал управления) ----------
 
 def handle_command(text, state):
     parts = text[1:].split(maxsplit=1)
@@ -234,7 +239,10 @@ def handle_command(text, state):
         chat_id = create_chat(arg)
         state["active_chat"] = chat_id
         save_state(state)
-        return f"✅ Создан новый чат: **{chat_id}**\nВсе следующие вопросы пойдут в него."
+        return (
+            f"✅ Создан новый чат: **{chat_id}**\n"
+            f"Все следующие вопросы в канале работы пойдут в него."
+        )
 
     if cmd == "list":
         chats = list_chats()
@@ -285,7 +293,7 @@ def handle_command(text, state):
     return f"❌ Неизвестная команда: `!{cmd}`. Введите `!help`."
 
 
-# ---------- Обработка вопроса ----------
+# ---------- Обработка вопроса (пишем в канал работы) ----------
 
 def build_answer_message(sender, chat_id, model, question, answer, thinking=False):
     preview = question[:500] + ("..." if len(question) > 500 else "")
@@ -298,7 +306,7 @@ def build_answer_message(sender, chat_id, model, question, answer, thinking=Fals
     )
 
 
-def process_question(text, sender, state):
+def process_question(text, sender, state, own_msg_ids):
     chat_id = state.get("active_chat")
     if not chat_id:
         chat_id = create_chat("default")
@@ -314,11 +322,11 @@ def process_question(text, sender, state):
     api_messages = list(chat.get("messages", [])) + [{"role": "user", "content": text}]
 
     resp = rc_send_message(
-        DP_OUT_ID,
+        DP_CHAT_ID,
         build_answer_message(sender, chat_id, model, text, "⏳ Думаю...", thinking=True),
+        own_msg_ids,
     )
     if not resp.get("success"):
-        print(f"[RC] Не удалось отправить заглушку: {resp}")
         return
     msg_id = resp["message"]["_id"]
 
@@ -329,7 +337,7 @@ def process_question(text, sender, state):
         now = time.time()
         if now - last_update > UPDATE_INTERVAL:
             rc_update_message(
-                DP_OUT_ID, msg_id,
+                DP_CHAT_ID, msg_id,
                 build_answer_message(sender, chat_id, model, text, full_answer, thinking=True),
             )
             last_update = now
@@ -338,7 +346,7 @@ def process_question(text, sender, state):
         full_answer = "[Пустой ответ от DeepSeek]"
 
     rc_update_message(
-        DP_OUT_ID, msg_id,
+        DP_CHAT_ID, msg_id,
         build_answer_message(sender, chat_id, model, text, full_answer),
     )
 
@@ -354,50 +362,75 @@ def process_question(text, sender, state):
 def main():
     CHATS_DIR.mkdir(parents=True, exist_ok=True)
     state = load_state()
+    own_msg_ids = set()
 
-    print(f"Мост v2 запущен.")
+    print("Мост v2.5 запущен.")
+    print(f"  Канал управления: {DP_CTRL_ID}")
+    print(f"  Канал работы:     {DP_CHAT_ID}")
     print(f"  Активный чат: {state.get('active_chat') or '—'}")
     print(f"  Модель:       {state.get('model', DEFAULT_MODEL)}")
-    print(f"  Каталог чатов: {CHATS_DIR}")
     print(f"  Ctrl+C для остановки.\n")
 
-    history = rc_get_history(DP_IN_ID, count=1)
-    last_ts = history[0]["ts"] if history else None
-    if last_ts:
-        print(f"Следим с ts={last_ts}\n")
-    else:
-        print("Канал dp_in пуст, ждём сообщений...\n")
+    hist_in = rc_get_history(DP_CTRL_ID, count=1)
+    hist_out = rc_get_history(DP_CHAT_ID, count=1)
+    last_ts_in = hist_in[0]["ts"] if hist_in else None
+    last_ts_out = hist_out[0]["ts"] if hist_out else None
+    print(f"  last_ts_in  = {last_ts_in}")
+    print(f"  last_ts_out = {last_ts_out}\n")
 
     while True:
         try:
-            history = rc_get_history(DP_IN_ID, count=20, oldest=last_ts)
-            for msg in reversed(history):
+            # --- Канал управления: только команды ---
+            for msg in reversed(rc_get_history(DP_CTRL_ID, count=20, oldest=last_ts_in)):
                 ts = msg["ts"]
-                if last_ts and ts <= last_ts:
+                if last_ts_in and ts <= last_ts_in:
                     continue
-                last_ts = ts
-
+                last_ts_in = ts
+                if msg["_id"] in own_msg_ids:
+                    continue
+                if msg.get("files") or msg.get("attachments"):
+                    continue
                 text = (msg.get("msg") or "").strip()
                 if not text:
                     continue
+                sender = msg.get("u", {}).get("username", "unknown")
 
+                if text.startswith("!"):
+                    print(f"[{datetime.now():%H:%M:%S}] CTRL {sender}: {text}")
+                    reply = handle_command(text, state)
+                    rc_send_message(DP_CTRL_ID, reply, own_msg_ids)
+                else:
+                    rc_send_message(
+                        DP_CTRL_ID,
+                        f"⚠️ **{sender}**, это канал команд. Здесь пишите `!help`, "
+                        f"`!new <имя>`, `!list`, `!use <chat_id>`, `!model flash|pro`.\n"
+                        f"Вопросы к DeepSeek — в канал работы.",
+                        own_msg_ids,
+                    )
+
+            # --- Канал работы: вопросы ---
+            for msg in reversed(rc_get_history(DP_CHAT_ID, count=20, oldest=last_ts_out)):
+                ts = msg["ts"]
+                if last_ts_out and ts <= last_ts_out:
+                    continue
+                last_ts_out = ts
+                if msg["_id"] in own_msg_ids:
+                    continue
+                text = (msg.get("msg") or "").strip()
+                if not text:
+                    continue
                 sender = msg.get("u", {}).get("username", "unknown")
 
                 if msg.get("files") or msg.get("attachments"):
                     rc_send_message(
-                        DP_OUT_ID,
-                        f"⚠️ **{sender}**, вложения пока не поддерживаются в v2. "
-                        f"Будут в v2.1 (только для `!model flash`).",
+                        DP_CHAT_ID,
+                        f"⚠️ **{sender}**, вложения пока не поддерживаются в v2.5. "
+                        f"Будут в v2.6 (только для `!model flash`).",
+                        own_msg_ids,
                     )
                     continue
 
-                if text.startswith("!"):
-                    print(f"[{datetime.now():%H:%M:%S}] КОМАНДА от {sender}: {text}")
-                    reply = handle_command(text, state)
-                    rc_send_message(DP_OUT_ID, reply)
-                    continue
-
-                process_question(text, sender, state)
+                process_question(text, sender, state, own_msg_ids)
         except KeyboardInterrupt:
             print("\nОстановлено по Ctrl+C")
             return
