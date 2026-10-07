@@ -6,6 +6,7 @@ import shutil
 import base64
 import mimetypes
 import traceback
+import re
 from datetime import datetime
 from pathlib import Path
 
@@ -13,7 +14,35 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 from settings import require, pick, work_dir
 
+# ================== ЛОГГЕР ==================
+LOG_LEVEL = "INFO"          # DEBUG | INFO | WARN | ERROR
+LOG_FILE  = None            # задаётся ниже, после WORK_DIR
+
+_log_fh = None
+
+def _log_write(level, msg):
+    global _log_fh
+    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    line = f"[{ts}] [{level:5}] {msg}"
+    # В консоль — WARN/ERROR, плюс INFO если явно разрешено
+    lvl_order = {"DEBUG": 10, "INFO": 20, "WARN": 30, "ERROR": 40}
+    if lvl_order[level] >= lvl_order.get(LOG_LEVEL, 20):
+        print(line)
+    if _log_fh:
+        try:
+            _log_fh.write(line + "\n")
+            _log_fh.flush()
+        except Exception:
+            pass
+
+def log_d(msg): _log_write("DEBUG", msg)
+def log_i(msg): _log_write("INFO",  msg)
+def log_w(msg): _log_write("WARN",  msg)
+def log_e(msg): _log_write("ERROR", msg)
+
 # ================== НАСТРОЙКИ ==================
+API_VERSION = "3.5"
+BOT_MARK = "\u200b"   # невидимый маркер своих сообщений (zero-width space) то что бот отправил в чат он должен знать что  это его сообщение а не пользователя. Что бы не отправить его на обработку в DeepSeek API
 # Сюда подставляется базовый URL сервера Rocket.Chat, без слэша на конце.
 # Значение берётся из ROCKET_URL в файле .env.
 ROCKET_URL = require("ROCKET_URL", "базовый URL Rocket.Chat без слэша на конце, например https://chat.example.com")
@@ -44,18 +73,32 @@ WORK_DIR = work_dir()
 CHATS_DIR  = WORK_DIR / "chats"
 ARCH_DIR   = WORK_DIR / "archives"
 STATE_FILE = WORK_DIR / "state.json"
+# Открываем файл лога (при старте)
+WORK_DIR.mkdir(parents=True, exist_ok=True)
+try:
+    _log_fh = open(WORK_DIR / "bridge.log", "a", encoding="utf-8")
+except Exception as e:
+    print(f"[logger] не удалось открыть bridge.log: {e}")
+# --- Адаптивный опрос ---
+POLL_INTERVAL_MIN = 5.0     # когда идёт активность были (3.0, 5.0)
+POLL_INTERVAL_MAX = 90.0    # когда в каналах тихо были (10.0, 15.0, 60.0)
+POLL_INTERVAL_STEP = 8.0    # шаг увеличения паузы при пустом опросе были (1.5, 5.0)
+POLL_INTERVAL = POLL_INTERVAL_MIN   # текущее значение (меняется в цикле)
 
-POLL_INTERVAL   = 2.0
-UPDATE_INTERVAL = 0.7
+# --- Обновление стрима в чате ---
+UPDATE_INTERVAL = 3.0              # мин. пауза между chat.update
+MIN_DELTA_FOR_UPDATE = 40          # мин. прирост символов, чтобы обновлять
+MAX_SILENCE_BEFORE_UPDATE = 5.0    # принудительное обновление, если давно не было
 
 # Приблизительный лимит токенов в context.json
 MAX_CONTEXT_TOKENS = 40000
 
 # --- throttle для Rocket.Chat ---
-RC_MIN_SEND_INTERVAL = 1.5      # сек между сообщениями
+RC_MIN_SEND_INTERVAL =  5.0      # сек между сообщениями (было 1.5, 3.0)
 RC_RATE_LIMIT_BACKOFF = 61.0    # сек паузы после 429
 _last_send_ts = 0.0
 _rate_limited_until = 0.0
+_rate_limit_just_resumed = False    # выставляется один раз, когда пауза 429 истекла
 # ================================================
 
 rc_headers = {
@@ -271,7 +314,7 @@ def truncate_context_if_needed(chat_id):
 
     chat["messages"] = kept
     save_context(chat_id, chat)
-    print(f"[{chat_id}] Контекст усечён ({total}→{tokens} токенов), "
+    log_i(f"[{chat_id}] Контекст усечён ({total}→{tokens} токенов), "
           f"старый срез → {archive_name}")
 
 
@@ -292,25 +335,92 @@ def archive_chat(chat_id):
 
 # ---------- Rocket.Chat ----------
 
+# Кэш: {room_id: "groups.history" | "channels.history" | "im.history"}
+_history_endpoint_cache = {}
+
+def _remember_endpoint(room_id, ep):
+    if _history_endpoint_cache.get(room_id) != ep:
+        _history_endpoint_cache[room_id] = ep
+        log_i(f"history endpoint для {room_id[:12]}… = {ep}")
+
 def rc_get_history(room_id, count=20, oldest=None):
+    """Универсальный history с кэшем рабочего endpoint."""
+    global _rate_limited_until, _rate_limit_just_resumed
+
+    now = time.time()
+    if now < _rate_limited_until:
+        return []
+
+    # Только что вышли из паузы 429 → один раз ставим флаг
+    if _rate_limited_until > 0:
+        _rate_limit_just_resumed = True
+        _rate_limited_until = 0.0
+
     params = {"roomId": room_id, "count": count}
     if oldest:
         params["oldest"] = oldest
-    try:
-        r = requests.get(
-            f"{ROCKET_URL}/api/v1/im.history",
-            headers=rc_headers, params=params,
-            verify=False, timeout=15,
-        )
+
+    cached = _history_endpoint_cache.get(room_id)
+    candidates = [cached] if cached else ["groups.history", "channels.history", "im.history"]
+
+    for ep in candidates:
+        try:
+            r = requests.get(
+                f"{ROCKET_URL}/api/v1/{ep}",
+                headers=rc_headers, params=params,
+                verify=False, timeout=15,
+            )
+        except Exception as e:
+            log_w(f"{ep} exception: {e}")
+            continue
+
         if r.status_code == 200:
             data = r.json()
             if data.get("success"):
+                _remember_endpoint(room_id, ep)
                 return data.get("messages", [])
-        else:
-            print(f"[RC] history HTTP {r.status_code}: {r.text[:120]}")
-    except Exception as e:
-        print(f"[RC] history exception: {e}")
+            # success:false — не тот тип, пробуем дальше (без логирования)
+            continue
+
+        if r.status_code == 429:
+            wait_s = _parse_retry_after(r)
+            _rate_limited_until = time.time() + wait_s
+            log_w(f"429 на {ep}: пауза {wait_s:.0f}с "
+                  f"(до {datetime.fromtimestamp(_rate_limited_until):%H:%M:%S})")
+            return []
+
+        if r.status_code == 404:
+            # endpoint отсутствует на этом сервере — запомним и пропустим
+            log_d(f"{ep} → 404, пропускаем")
+            continue
+
+        if r.status_code == 400:
+            # invalid-channel — не тот тип комнаты, пропускаем тихо
+            continue
+
+        log_w(f"{ep} HTTP {r.status_code}: {r.text[:120]}")
+
+    # Если кэш не сработал — сбрасываем его и запомним на след. раз
+    if cached:
+        log_w(f"кэш endpoint для {room_id[:12]}… не сработал, сброс")
+        _history_endpoint_cache.pop(room_id, None)
     return []
+
+
+def _parse_retry_after(resp):
+    hdr = resp.headers.get("Retry-After")
+    if hdr:
+        try:
+            return max(float(hdr), 1.0) + 1.0
+        except Exception:
+            pass
+    try:
+        m = re.search(r"wait\s+(\d+)\s+second", resp.text, re.IGNORECASE)
+        if m:
+            return float(m.group(1)) + 1.0
+    except Exception:
+        pass
+    return RC_RATE_LIMIT_BACKOFF
 
 
 def rc_get_latest_ts(room_id):
@@ -324,7 +434,7 @@ def _rc_throttle_wait():
     now = time.time()
     if now < _rate_limited_until:
         wait = _rate_limited_until - now
-        print(f"[RC] пауза после 429: {wait:.1f}с")
+        log_d(f"пауза после 429: {wait:.1f}с")
         time.sleep(wait)
         now = time.time()
     delta = now - _last_send_ts
@@ -338,23 +448,24 @@ def rc_send_message(room_id, text, own_msg_ids):
     try:
         r = requests.post(
             f"{ROCKET_URL}/api/v1/chat.postMessage",
-            headers=rc_headers, json={"roomId": room_id, "text": text},
+            headers=rc_headers, json={"roomId": room_id, "text": BOT_MARK + text},
             verify=False, timeout=15,
         )
         resp = r.json()
         if not resp.get("success"):
             err = str(resp.get("error", "")).lower()
             if "too many requests" in err:
-                _rate_limited_until = time.time() + RC_RATE_LIMIT_BACKOFF
-                print(f"[RC] 429 → пауза {RC_RATE_LIMIT_BACKOFF:.0f}с")
+                wait_s = _parse_retry_after(r)
+                _rate_limited_until = time.time() + wait_s
+                log_i(f"429 → пауза {wait_s:.0f}с")
             else:
-                print(f"[RC] postMessage error: {resp}")
+                log_w(f"postMessage error: {resp}")
             return resp
         own_msg_ids.add(resp["message"]["_id"])
         _last_send_ts = time.time()
         return resp
     except Exception as e:
-        print(f"[RC] postMessage exception: {e}")
+        log_w(f"postMessage exception: {e}")
         return {}
 
 def rc_update_message(room_id, msg_id, text):
@@ -364,19 +475,20 @@ def rc_update_message(room_id, msg_id, text):
         r = requests.post(
             f"{ROCKET_URL}/api/v1/chat.update",
             headers=rc_headers,
-            json={"roomId": room_id, "msgId": msg_id, "text": text},
+            json={"roomId": room_id, "msgId": msg_id, "text":  BOT_MARK + text},
             verify=False, timeout=15,
         )
         resp = r.json()
         if not resp.get("success"):
             err = str(resp.get("error", "")).lower()
             if "too many requests" in err:
-                _rate_limited_until = time.time() + RC_RATE_LIMIT_BACKOFF
-                print(f"[RC] 429 (update) → пауза {RC_RATE_LIMIT_BACKOFF:.0f}с")
+                wait_s = _parse_retry_after(r)
+                _rate_limited_until = time.time() + wait_s
+                log_i(f"429 → пауза {wait_s:.0f}с")
         _last_send_ts = time.time()
         return resp
     except Exception as e:
-        print(f"[RC] update exception: {e}")
+        log_w(f"update exception: {e}")
         return {}
 
 def rc_download_file(file_obj, dest_dir):
@@ -393,7 +505,7 @@ def rc_download_file(file_obj, dest_dir):
             verify=False, timeout=60, stream=True,
         )
         if r.status_code != 200:
-            print(f"[RC] download {full_url} → {r.status_code}")
+            log_w(f"download {full_url} → {r.status_code}")
             return None
         fname = file_obj.get("name") or Path(url).name or "file"
         dest_dir.mkdir(parents=True, exist_ok=True)
@@ -404,7 +516,7 @@ def rc_download_file(file_obj, dest_dir):
                     f.write(chunk)
         return dest
     except Exception as e:
-        print(f"[RC] download exception: {e}")
+        log_w(f"download exception: {e}")
         return None
 
 
@@ -417,7 +529,7 @@ def rc_get_me():
         if r.status_code == 200:
             return r.json()
     except Exception as e:
-        print(f"[RC] me exception: {e}")
+        log_w(f"me exception: {e}")
     return {}
 
 
@@ -476,7 +588,7 @@ def content_to_api(content, chat_id):
                             "image_url": {"url": encode_image_data_url(p)},
                         })
                     except Exception as e:
-                        print(f"[{chat_id}] image encode: {e}")
+                        log_w(f"[{chat_id}] image encode: {e}")
         return parts if parts else "(пусто)"
     return str(content)
 
@@ -618,6 +730,9 @@ def build_answer_message(sender, chat_id, model, question, answer, thinking=Fals
 
 def process_question(text, files, sender, state, own_msg_ids, chat_id):
     model = state.get("model", DEFAULT_MODEL)
+    # Страховка: если по какой-то причине прилетело наше же сообщение — отсекаем
+    if text.startswith(BOT_MARK):
+        return
 
     # 1. Скачиваем вложения в media/
     saved_files = []
@@ -627,7 +742,7 @@ def process_question(text, files, sender, state, own_msg_ids, chat_id):
             if p:
                 saved_files.append(p)
         if saved_files:
-            print(f"[{chat_id}] скачано файлов: {len(saved_files)}")
+            log_i(f"[{chat_id}] скачано файлов: {len(saved_files)}")
 
     images = [p for p in saved_files if is_image(p)]
     non_images = [p for p in saved_files if not is_image(p)]
@@ -686,18 +801,25 @@ def process_question(text, files, sender, state, own_msg_ids, chat_id):
 
     # 6. Стрим ответа
     full_answer = ""
-    last_update = 0.0
+    last_update = time.time()
+    last_len_at_update = 0
     for chunk in call_deepseek_stream(api_messages, model):
         full_answer += chunk
         now = time.time()
-        if now - last_update > UPDATE_INTERVAL:
+        grew = len(full_answer) - last_len_at_update
+        since_update = now - last_update
+        should_update = (
+            since_update > UPDATE_INTERVAL and grew >= MIN_DELTA_FOR_UPDATE
+        ) or (since_update > MAX_SILENCE_BEFORE_UPDATE)
+        if should_update:
             rc_update_message(
                 DP_CHAT_ID, msg_id,
                 build_answer_message(sender, chat_id, model, text,
                                      full_answer, thinking=True),
             )
             last_update = now
-
+            last_len_at_update = len(full_answer)
+            
     if not full_answer:
         full_answer = "[Пустой ответ от DeepSeek]"
 
@@ -721,12 +843,13 @@ def process_question(text, files, sender, state, own_msg_ids, chat_id):
     save_context(chat_id, chat)
     truncate_context_if_needed(chat_id)
 
-    print(f"[{datetime.now():%H:%M:%S}] [{chat_id}] {len(full_answer)} симв.")
+    log_i(f"[{datetime.now():%H:%M:%S}] [{chat_id}] {len(full_answer)} симв.")
 
 
 # ---------- Главный цикл ----------
 
 def main():
+    global POLL_INTERVAL, _rate_limit_just_resumed
     CHATS_DIR.mkdir(parents=True, exist_ok=True)
     ARCH_DIR.mkdir(parents=True, exist_ok=True)
     state = load_state()
@@ -734,18 +857,18 @@ def main():
 
     me = rc_get_me()
     own_username = me.get("username")
-    print("Мост v3.0 запущен.")
-    print(f"  Мой username:     {own_username}")
-    print(f"  Канал управления: {DP_CTRL_ID}")
-    print(f"  Канал работы:     {DP_CHAT_ID}")
-    print(f"  Активный чат:     {state.get('active_chat') or '—'}")
-    print(f"  Модель:           {state.get('model', DEFAULT_MODEL)}")
-    print("  Ctrl+C для остановки.\n")
+    log_i(f"Мост v{API_VERSION} запущен.")
+    log_i(f"Мой username:     {own_username}")
+    log_i(f"Канал управления: {DP_CTRL_ID}")
+    log_i(f"Канал работы:     {DP_CHAT_ID}")
+    log_i(f"Активный чат:     {state.get('active_chat') or '—'}")
+    log_i(f"Модель:           {state.get('model', DEFAULT_MODEL)}")
+    log_i("Ctrl+C для остановки.")
 
     # Если активный чат пропал — пересоздаём
     active = state.get("active_chat")
     if active and ensure_chat_dir(active):
-        print(f"  [warn] Чат {active} отсутствовал в chats/ — пересоздан.")
+        log_w(f"Чат {active} отсутствовал в chats/ — пересоздан.")
         tracking = load_tracking(active)
         tracking["last_processed_ts"] = rc_get_latest_ts(DP_CHAT_ID) or \
             datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
@@ -757,9 +880,12 @@ def main():
         # не смогли узнать — ставим отсечку на текущий момент,
         # чтобы не обрабатывать всю историю канала
         last_ts_in = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
-        print(f"  [warn] last_ts_in не получен, стартуем с {last_ts_in}")
-    print(f"  last_ts_in = {last_ts_in}\n")
+        log_w(f"last_ts_in не получен, стартуем с {last_ts_in}")
+    log_i(f"last_ts_in = {last_ts_in}")
+    log_i("=" * 40)
     while True:
+        ctrl_msgs = []
+        work_msgs = []
         try:
             # ---------- Канал управления ----------
             prev_active = state.get("active_chat")
@@ -769,6 +895,9 @@ def main():
                 if last_ts_in and ts <= last_ts_in:
                     continue
                 last_ts_in = ts
+                raw = msg.get("msg") or ""
+                if raw.startswith(BOT_MARK):
+                    continue
                 if msg["_id"] in own_msg_ids:
                     continue
                 if msg.get("files") or msg.get("attachments"):
@@ -779,7 +908,7 @@ def main():
                 sender = msg.get("u", {}).get("username", "unknown")
 
                 if text.startswith("!"):
-                    print(f"[{datetime.now():%H:%M:%S}] CTRL {sender}: {text}")
+                    log_i(f"[{datetime.now():%H:%M:%S}] CTRL {sender}: {text}")
                     reply = handle_command(text, state, own_msg_ids)
                     rc_send_message(DP_CTRL_ID, reply, own_msg_ids)
                 else:
@@ -798,7 +927,7 @@ def main():
                 tracking = load_tracking(new_active)
                 tracking["last_processed_ts"] = last_ts_in
                 save_tracking(new_active, tracking)
-                print(f"  [switch] → {new_active}, курсор: {last_ts_in}")
+                log_i(f"  [switch] → {new_active}, курсор: {last_ts_in}")
 
             # ---------- Канал работы ----------
             active = state.get("active_chat")
@@ -810,7 +939,7 @@ def main():
                 tracking["last_processed_ts"] = rc_get_latest_ts(DP_CHAT_ID) or \
                     datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
                 save_tracking(active, tracking)
-                print(f"  [auto] Активный чат не задан — создан {active}")
+                log_i(f"  [auto] Активный чат не задан — создан {active}")
 
             ensure_chat_dir(active)
             tracking = load_tracking(active)
@@ -823,7 +952,7 @@ def main():
                          datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
                 tracking["last_processed_ts"] = cursor
                 save_tracking(active, tracking)
-                print(f"  [warn] курсор рабочего канала не получен, стартуем с {cursor}")
+                log_i(f"Курсор рабочего канала не получен, стартуем с {cursor}")
             
             work_msgs = rc_get_history(DP_CHAT_ID, count=20, oldest=cursor)
             for msg in reversed(work_msgs):
@@ -835,6 +964,9 @@ def main():
                 tracking["last_processed_ts"] = ts
                 save_tracking(active, tracking)
 
+                raw = msg.get("msg") or ""
+                if raw.startswith(BOT_MARK):
+                    continue
                 if msg["_id"] in own_msg_ids:
                     continue
 
@@ -847,11 +979,26 @@ def main():
                 process_question(text, files, sender, state, own_msg_ids, active)
 
         except KeyboardInterrupt:
-            print("\nОстановлено по Ctrl+C")
+            log_i("Остановлено по Ctrl+C")
             return
         except Exception as e:
-            print(f"[main] Ошибка в цикле: {e}")
-            traceback.print_exc()
+            log_e(f"Ошибка в цикле: {e}\n{traceback.format_exc()}")
+
+        got_something = bool(ctrl_msgs) or bool(work_msgs)
+
+        if _rate_limit_just_resumed:
+            log_i("вышли из паузы 429 → форс-опрос")
+            POLL_INTERVAL = POLL_INTERVAL_MIN
+            _rate_limit_just_resumed = False
+        elif got_something:
+            if POLL_INTERVAL != POLL_INTERVAL_MIN:
+                log_d(f"активность → интервал {POLL_INTERVAL_MIN}с")
+            POLL_INTERVAL = POLL_INTERVAL_MIN
+        else:
+            new_interval = min(POLL_INTERVAL + POLL_INTERVAL_STEP, POLL_INTERVAL_MAX)
+            if int(new_interval) != int(POLL_INTERVAL):
+                log_d(f"тишина → интервал {new_interval:.1f}с")
+            POLL_INTERVAL = new_interval
 
         time.sleep(POLL_INTERVAL)
 
