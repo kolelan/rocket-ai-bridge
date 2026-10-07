@@ -41,7 +41,7 @@ def log_w(msg): _log_write("WARN",  msg)
 def log_e(msg): _log_write("ERROR", msg)
 
 # ================== НАСТРОЙКИ ==================
-API_VERSION = "3.5"
+API_VERSION = "3.6"
 BOT_MARK = "\u200b"   # невидимый маркер своих сообщений (zero-width space) то что бот отправил в чат он должен знать что  это его сообщение а не пользователя. Что бы не отправить его на обработку в DeepSeek API
 # Сюда подставляется базовый URL сервера Rocket.Chat, без слэша на конце.
 # Значение берётся из ROCKET_URL в файле .env.
@@ -72,30 +72,33 @@ DEFAULT_MODEL    = "deepseek-v4-pro"
 WORK_DIR = work_dir()
 CHATS_DIR  = WORK_DIR / "chats"
 ARCH_DIR   = WORK_DIR / "archives"
+LOG_DIR    = WORK_DIR / "log"
 STATE_FILE = WORK_DIR / "state.json"
-# Открываем файл лога (при старте)
+
+# Открываем новый файл лога для этой сессии.
+# Один запуск bridge.py = один файл вида 2026-10-07_11-24-12_bridge.log
 WORK_DIR.mkdir(parents=True, exist_ok=True)
+LOG_DIR.mkdir(parents=True, exist_ok=True)
+_session_ts = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+LOG_FILE = LOG_DIR / f"{_session_ts}_bridge.log"
 try:
-    _log_fh = open(WORK_DIR / "bridge.log", "a", encoding="utf-8")
+    _log_fh = open(LOG_FILE, "w", encoding="utf-8")
 except Exception as e:
-    print(f"[logger] не удалось открыть bridge.log: {e}")
+    print(f"[logger] не удалось открыть {LOG_FILE}: {e}")
+    
 # --- Адаптивный опрос ---
-POLL_INTERVAL_MIN = 5.0     # когда идёт активность были (3.0, 5.0)
-POLL_INTERVAL_MAX = 90.0    # когда в каналах тихо были (10.0, 15.0, 60.0)
-POLL_INTERVAL_STEP = 8.0    # шаг увеличения паузы при пустом опросе были (1.5, 5.0)
+POLL_INTERVAL_MIN = 3.0     # когда идёт активность были (2.0, 3.0, 5.0)
+POLL_INTERVAL_MAX = 15.0    # когда в каналах тихо были (10.0, 15.0, 60.0, 90.0)
+POLL_INTERVAL_STEP = 2.5    # шаг увеличения паузы при пустом опросе были (1.5, 5.0, 8.0)
 POLL_INTERVAL = POLL_INTERVAL_MIN   # текущее значение (меняется в цикле)
 
-# --- Обновление стрима в чате ---
-UPDATE_INTERVAL = 3.0              # мин. пауза между chat.update
-MIN_DELTA_FOR_UPDATE = 40          # мин. прирост символов, чтобы обновлять
-MAX_SILENCE_BEFORE_UPDATE = 5.0    # принудительное обновление, если давно не было
 
 # Приблизительный лимит токенов в context.json
 MAX_CONTEXT_TOKENS = 40000
 
 # --- throttle для Rocket.Chat ---
-RC_MIN_SEND_INTERVAL =  5.0      # сек между сообщениями (было 1.5, 3.0)
-RC_RATE_LIMIT_BACKOFF = 61.0    # сек паузы после 429
+RC_MIN_SEND_INTERVAL =  1.5      # сек между сообщениями (было 1.5, 3.0, 5.0 )
+RC_RATE_LIMIT_BACKOFF = 61.0    # сек паузы после 429 (было 61.0 )
 _last_send_ts = 0.0
 _rate_limited_until = 0.0
 _rate_limit_just_resumed = False    # выставляется один раз, когда пауза 429 истекла
@@ -799,30 +802,17 @@ def process_question(text, files, sender, state, own_msg_ids, chat_id):
         return
     msg_id = resp["message"]["_id"]
 
-    # 6. Стрим ответа
+    # 6. Собираем полный ответ БЕЗ промежуточных обновлений.
+    #    Плейсхолдер «⏳ Думаю...» остаётся висеть, пока DeepSeek думает.
+    #    Затем одним POST заменяем его на финальный текст.
     full_answer = ""
-    last_update = time.time()
-    last_len_at_update = 0
     for chunk in call_deepseek_stream(api_messages, model):
         full_answer += chunk
-        now = time.time()
-        grew = len(full_answer) - last_len_at_update
-        since_update = now - last_update
-        should_update = (
-            since_update > UPDATE_INTERVAL and grew >= MIN_DELTA_FOR_UPDATE
-        ) or (since_update > MAX_SILENCE_BEFORE_UPDATE)
-        if should_update:
-            rc_update_message(
-                DP_CHAT_ID, msg_id,
-                build_answer_message(sender, chat_id, model, text,
-                                     full_answer, thinking=True),
-            )
-            last_update = now
-            last_len_at_update = len(full_answer)
-            
+
     if not full_answer:
         full_answer = "[Пустой ответ от DeepSeek]"
 
+    # Финальный update — 1 POST вместо 15–20
     rc_update_message(
         DP_CHAT_ID, msg_id,
         build_answer_message(sender, chat_id, model, text, full_answer),
@@ -858,6 +848,7 @@ def main():
     me = rc_get_me()
     own_username = me.get("username")
     log_i(f"Мост v{API_VERSION} запущен.")
+    log_i(f"Лог этой сессии: {LOG_FILE}")
     log_i(f"Мой username:     {own_username}")
     log_i(f"Канал управления: {DP_CTRL_ID}")
     log_i(f"Канал работы:     {DP_CHAT_ID}")
